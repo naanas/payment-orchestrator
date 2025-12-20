@@ -46,13 +46,18 @@ export class PaymentOrchestrator {
 
       if (!transaction) throw new Error('Failed to create transaction');
 
+      // Define Base URL untuk simulasi (Default localhost:3000)
+      const PORT = process.env.PORT || 3000;
+      const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
+
       // 5. Generate payment data based on partner type
       let paymentData: any = {};
       
       if (method.payment_partners.type === 'EWALLET') {
         paymentData = {
           partner_transaction_id: `EW${Date.now()}`,
-          payment_url: `https://${method.payment_partners.code.toLowerCase()}.com/pay/${transactionId}`,
+          // 👇 UBAH DI SINI: Link simulasi agar bisa diklik langsung lunas
+          payment_url: `${baseUrl}/api/payments/pay-simulate/${transactionId}`,
           deeplink: `${method.payment_partners.code.toLowerCase()}://payment/${transactionId}`
         };
       } else if (method.payment_partners.type === 'BANK_VA') {
@@ -69,7 +74,7 @@ export class PaymentOrchestrator {
       } else if (method.payment_partners.type === 'PAYMENT_GATEWAY') {
         paymentData = {
           partner_transaction_id: `PG${Date.now()}`,
-          payment_url: `https://payment.example.com/pay/${transactionId}`,
+          payment_url: `https://payment.example.com/pay/${transactionId}`, // Gateway biasanya external
           qr_data: `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${transactionId}`
         };
       } else {
@@ -113,24 +118,39 @@ export class PaymentOrchestrator {
 
     if (error || !transaction) throw new Error('Transaction not found');
 
-    // Simulate random status update
-    const statuses = ['PENDING', 'PROCESSING', 'SUCCESS', 'FAILED', 'EXPIRED'];
-    const weights = [0.1, 0.1, 0.6, 0.1, 0.1]; // 60% success
-    const randomStatus = this.getWeightedRandom(statuses, weights);
-
-    // Only update if different
-    if (randomStatus !== transaction.status) {
-      await db.transactions()
-        .update({ 
-          status: randomStatus,
-          ...(randomStatus === 'SUCCESS' ? { settled_at: new Date().toISOString() } : {})
-        })
-        .eq('id', transaction.id);
-      
-      return { ...transaction, status: randomStatus };
-    }
-
     return transaction;
+  }
+
+  // 👇 METHOD UPDATE STATUS (Dipakai oleh Webhook & Simulasi)
+  static async updateStatus(transactionId: string, status: 'SUCCESS' | 'FAILED' | 'PENDING') {
+    try {
+      // 1. Cek transaksi exist
+      const { data: transaction, error: fetchError } = await db.transactions()
+        .select('*')
+        .eq('transaction_id', transactionId)
+        .single();
+
+      if (fetchError || !transaction) throw new Error('Transaction not found');
+
+      // 2. Update status & timestamp
+      const { data: updatedTransaction, error: updateError } = await db.transactions()
+        .update({ 
+          status: status,
+          updated_at: new Date().toISOString(),
+          // Jika sukses, set waktu settlement
+          ...(status === 'SUCCESS' ? { settled_at: new Date().toISOString() } : {})
+        })
+        .eq('transaction_id', transactionId)
+        .select()
+        .single();
+
+      if (updateError) throw new Error(updateError.message);
+
+      return updatedTransaction;
+
+    } catch (error: any) {
+      throw new Error(`Failed to update status: ${error.message}`);
+    }
   }
 
   private static generateVANumber(partnerCode: string): string {
@@ -154,22 +174,5 @@ export class PaymentOrchestrator {
       'MANDIRI_VA': 'Mandiri'
     };
     return names[partnerCode] || 'Bank';
-  }
-
-  private static getWeightedRandom(items: string[], weights: number[]): string {
-    let i;
-    for (i = 1; i < weights.length; i++) {
-      weights[i] += weights[i - 1];
-    }
-    
-    const random = Math.random() * weights[weights.length - 1];
-    
-    for (i = 0; i < weights.length; i++) {
-      if (weights[i] > random) {
-        break;
-      }
-    }
-    
-    return items[i];
   }
 }
