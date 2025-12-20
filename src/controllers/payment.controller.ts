@@ -63,6 +63,8 @@ export class PaymentController {
   static async handleWebhook(req: Request, res: Response) {
     try {
       const { transaction_id, status } = req.body;
+      const rawBody = req.body;       
+      const rawHeaders = req.headers;
 
       // Validasi Input
       if (!transaction_id || !status) {
@@ -80,7 +82,15 @@ export class PaymentController {
           error: 'Invalid status. Allowed: SUCCESS, FAILED, PENDING' 
         });
       }
-
+      // Log webhook ke database
+      await db.webhookLogs().insert({
+      provider: 'UNKNOWN', // Nanti bisa dideteksi dari header/body
+      transaction_id: transaction_id || null,
+      payload: rawBody,
+      headers: rawHeaders,
+      status: 'RECEIVED', // Status awal
+      received_at: new Date().toISOString()
+    });
       // Update via Orchestrator
       const result = await PaymentOrchestrator.updateStatus(transaction_id, status);
 
