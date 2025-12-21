@@ -25,7 +25,7 @@ export class AdminController {
       const token = jwt.sign(
         { userId: user.id, email: user.email, role: user.role },
         process.env.JWT_SECRET!,
-        { expiresIn: '7d' }
+        { expiresIn: 500 } // Gunakan angka 300 (detik) untuk 5 menit
       );
 
       // Update last login

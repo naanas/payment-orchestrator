@@ -1,4 +1,5 @@
 import { db } from '../../config/supabase';
+import axios from 'axios'; // 👈 Wajib: Tambahkan import axios
 
 export class PaymentOrchestrator {
   static async createPayment(amount: number, paymentMethodCode: string, customerData: any) {
@@ -46,7 +47,7 @@ export class PaymentOrchestrator {
 
       if (!transaction) throw new Error('Failed to create transaction');
 
-      // Define Base URL untuk simulasi (Default localhost:3000)
+      // Define Base URL untuk simulasi
       const PORT = process.env.PORT || 3000;
       const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
 
@@ -56,7 +57,7 @@ export class PaymentOrchestrator {
       if (method.payment_partners.type === 'EWALLET') {
         paymentData = {
           partner_transaction_id: `EW${Date.now()}`,
-          // 👇 UBAH DI SINI: Link simulasi agar bisa diklik langsung lunas
+          // Link simulasi agar bisa diklik langsung lunas
           payment_url: `${baseUrl}/api/payments/pay-simulate/${transactionId}`,
           deeplink: `${method.payment_partners.code.toLowerCase()}://payment/${transactionId}`
         };
@@ -74,7 +75,7 @@ export class PaymentOrchestrator {
       } else if (method.payment_partners.type === 'PAYMENT_GATEWAY') {
         paymentData = {
           partner_transaction_id: `PG${Date.now()}`,
-          payment_url: `https://payment.example.com/pay/${transactionId}`, // Gateway biasanya external
+          payment_url: `https://payment.example.com/pay/${transactionId}`,
           qr_data: `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${transactionId}`
         };
       } else {
@@ -121,8 +122,8 @@ export class PaymentOrchestrator {
     return transaction;
   }
 
-  // 👇 METHOD UPDATE STATUS (Dipakai oleh Webhook & Simulasi)
-  static async updateStatus(transactionId: string, status: 'SUCCESS' | 'FAILED' | 'PENDING') {
+  // 👇 METHOD UPDATE STATUS (MODIFIKASI UTAMA DI SINI)
+  static async updateStatus(transactionId: string, status: string) { // Ubah tipe status jadi string agar fleksibel
     try {
       // 1. Cek transaksi exist
       const { data: transaction, error: fetchError } = await db.transactions()
@@ -132,12 +133,11 @@ export class PaymentOrchestrator {
 
       if (fetchError || !transaction) throw new Error('Transaction not found');
 
-      // 2. Update status & timestamp
+      // 2. Update status & timestamp di Database Orchestrator
       const { data: updatedTransaction, error: updateError } = await db.transactions()
         .update({ 
           status: status,
           updated_at: new Date().toISOString(),
-          // Jika sukses, set waktu settlement
           ...(status === 'SUCCESS' ? { settled_at: new Date().toISOString() } : {})
         })
         .eq('transaction_id', transactionId)
@@ -145,6 +145,31 @@ export class PaymentOrchestrator {
         .single();
 
       if (updateError) throw new Error(updateError.message);
+
+      // ============================================================
+      // 3. KIRIM WEBHOOK KE ECOMMERCE (INTEGRASI BALIK)
+      // ============================================================
+      try {
+        // URL Webhook Ecommerce (Localhost Port 4000)
+        // Note: Di production, URL ini sebaiknya dinamis (disimpan di DB partners)
+        const ecommerceWebhookUrl = 'http://localhost:4000/api/webhook/payment';
+
+        console.log(`🚀 Sending webhook to ${ecommerceWebhookUrl}...`);
+        
+        await axios.post(ecommerceWebhookUrl, {
+          transaction_id: transactionId,
+          status: status,
+          updated_at: new Date().toISOString()
+        });
+        
+        console.log(`✅ Webhook sent successfully!`);
+
+      } catch (webhookError: any) {
+        // Kita hanya log error webhook, jangan throw error agar
+        // status di orchestrator tetap ter-update walau webhook gagal.
+        console.error(`⚠️ Failed to send webhook: ${webhookError.message}`);
+        console.error(`(Make sure Ecommerce API is running on port 4000)`);
+      }
 
       return updatedTransaction;
 

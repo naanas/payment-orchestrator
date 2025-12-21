@@ -21,5 +21,6 @@ export const db = {
   users: () => supabase.from('users'),
   auditLogs: () => supabase.from('audit_logs'),
   webhookLogs: () => supabase.from('webhook_logs'),
-  configurations: () => supabase.from('configurations')
+  configurations: () => supabase.from('configurations'),
+  merchants: () => supabase.from('merchants') 
 };
