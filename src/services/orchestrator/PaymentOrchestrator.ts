@@ -1,5 +1,5 @@
 import { db } from '../../config/supabase';
-import axios from 'axios'; // 👈 Wajib: Tambahkan import axios
+import axios from 'axios'; 
 
 export class PaymentOrchestrator {
   static async createPayment(amount: number, paymentMethodCode: string, customerData: any) {
@@ -123,7 +123,7 @@ export class PaymentOrchestrator {
   }
 
   // 👇 METHOD UPDATE STATUS (MODIFIKASI UTAMA DI SINI)
-  static async updateStatus(transactionId: string, status: string) { // Ubah tipe status jadi string agar fleksibel
+  static async updateStatus(transactionId: string, status: string) { 
     try {
       // 1. Cek transaksi exist
       const { data: transaction, error: fetchError } = await db.transactions()
@@ -150,12 +150,13 @@ export class PaymentOrchestrator {
       // 3. KIRIM WEBHOOK KE ECOMMERCE (INTEGRASI BALIK)
       // ============================================================
       try {
-        // URL Webhook Ecommerce (Localhost Port 4000)
-        // Note: Di production, URL ini sebaiknya dinamis (disimpan di DB partners)
-        const ecommerceWebhookUrl = 'http://localhost:4000/api/webhook/payment';
+        // [FIXED] Menggunakan Environment Variable untuk URL Webhook Ecommerce
+        // Pastikan Anda menambahkan ECOMMERCE_WEBHOOK_URL di file .env Payment Orchestrator
+        const ecommerceWebhookUrl = process.env.ECOMMERCE_WEBHOOK_URL || 'http://localhost:4000/api/webhook/payment';
 
-        console.log(`🚀 Sending webhook to ${ecommerceWebhookUrl}...`);
+        console.log(`🚀 Sending webhook to ${ecommerceWebhookUrl} for TRX: ${transactionId}...`);
         
+        // Kirim webhook
         await axios.post(ecommerceWebhookUrl, {
           transaction_id: transactionId,
           status: status,
@@ -168,7 +169,7 @@ export class PaymentOrchestrator {
         // Kita hanya log error webhook, jangan throw error agar
         // status di orchestrator tetap ter-update walau webhook gagal.
         console.error(`⚠️ Failed to send webhook: ${webhookError.message}`);
-        console.error(`(Make sure Ecommerce API is running on port 4000)`);
+        console.error(`(Make sure Ecommerce API is running and ECOMMERCE_WEBHOOK_URL env is set)`);
       }
 
       return updatedTransaction;
