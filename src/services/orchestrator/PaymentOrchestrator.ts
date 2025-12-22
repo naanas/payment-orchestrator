@@ -152,7 +152,7 @@ export class PaymentOrchestrator {
       try {
         // [FIXED] Menggunakan Environment Variable untuk URL Webhook Ecommerce
         // Pastikan Anda menambahkan ECOMMERCE_WEBHOOK_URL di file .env Payment Orchestrator
-        const ecommerceWebhookUrl = process.env.ECOMMERCE_WEBHOOK_URL || 'http://localhost:4000/api/webhook/payment';
+        const ecommerceWebhookUrl = process.env.ECOMMERCE_WEBHOOK_URL || 'https://ecommerce-api-topaz-iota.vercel.app/api/webhook/payment';
 
         console.log(`🚀 Sending webhook to ${ecommerceWebhookUrl} for TRX: ${transactionId}...`);
         
