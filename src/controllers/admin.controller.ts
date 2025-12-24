@@ -4,6 +4,90 @@ import jwt from 'jsonwebtoken';
 import { db } from '../config/supabase';
 
 export class AdminController {
+  
+  // =================================================================
+  // [BARU] Endpoint Config: Ambil Fee Dinamis dari Payment Method
+  // =================================================================
+  static async getConfig(req: Request, res: Response) {
+    try {
+      // 1. Terima kode metode dari Frontend (misal: ?code=BCA_VA)
+      const methodCode = req.query.code as string;
+
+      if (!methodCode) {
+        return res.status(400).json({ 
+          success: false, 
+          message: "Parameter 'code' wajib dikirim (contoh: ?code=BCA_VA)" 
+        });
+      }
+
+      // 2. Query ke payment_methods dan join ke payment_partners
+      // Mengambil fee_structure dari partner yang terkait dengan metode tersebut
+      const { data, error } = await db.paymentMethods()
+        .select(`
+          code,
+          name,
+          payment_partners (
+            name,
+            fee_structure
+          )
+        `)
+        .eq('code', methodCode)
+        .eq('is_active', true)
+        .single();
+
+      // 3. Validasi jika tidak ditemukan di DB
+      if (error || !data) {
+        console.warn(`Metode pembayaran '${methodCode}' tidak ditemukan atau tidak aktif.`);
+        return res.status(404).json({
+          success: false,
+          message: `Metode pembayaran '${methodCode}' tidak tersedia.`
+        });
+      }
+
+      // 4. Parsing Fee Structure
+      let adminFee = 0;
+      // Casting 'any' karena Supabase join return type bisa bervariasi
+      const partner = (data as any).payment_partners; 
+
+      if (partner && partner.fee_structure) {
+        const structure = partner.fee_structure;
+        
+        // Logic parsing JSON fee (menangani format number atau object)
+        if (typeof structure === 'number') {
+           adminFee = structure;
+        } else if (typeof structure === 'object') {
+           // Prioritas ambil nilai flat/fixed/admin_fee
+           adminFee = Number(structure.flat || structure.fixed || structure.admin_fee || 0);
+        } else if (typeof structure === 'string') {
+           adminFee = Number(structure);
+        }
+      }
+
+      // 5. Return Response
+      res.json({
+        success: true,
+        data: {
+          admin_fee: adminFee,
+          method_name: data.name,
+          provider: partner?.name,
+          currency: 'IDR'
+        }
+      });
+
+    } catch (error: any) {
+      console.error("Config Error:", error.message);
+      res.status(500).json({ 
+        success: false,
+        message: "Gagal mengambil konfigurasi Admin Fee",
+        error: error.message 
+      });
+    }
+  }
+
+  // =================================================================
+  // EXISTING METHODS (LOGIN, DASHBOARD, DLL)
+  // =================================================================
+
   static async login(req: Request, res: Response) {
     try {
       const { email, password } = req.body;
@@ -25,7 +109,7 @@ export class AdminController {
       const token = jwt.sign(
         { userId: user.id, email: user.email, role: user.role },
         process.env.JWT_SECRET!,
-        { expiresIn: 500 } // Gunakan angka 300 (detik) untuk 5 menit
+        { expiresIn: 500 } // Session 5 menit
       );
 
       // Update last login
