@@ -181,7 +181,7 @@ export class PaymentOrchestrator {
 
       // 3. KIRIM WEBHOOK DENGAN KEAMANAN (SIGNATURE)
       try {
-        const ecommerceWebhookUrl = process.env.ECOMMERCE_WEBHOOK_URL || 'https://ecommerce-api-topaz-iota.vercel.app/api/webhook/payment';
+        const ecommerceWebhookUrl = process.env.ECOMMERCE_WEBHOOK_URL || '';
         const secret = process.env.WEBHOOK_SECRET || 'rahasia-super-aman'; // Wajib sama dengan di Ecommerce API
 
         console.log(`🚀 Sending webhook to ${ecommerceWebhookUrl} for TRX: ${transactionId}...`);
