@@ -5,8 +5,10 @@ import { db } from '../config/supabase';
 export class PaymentController {
   static async createPayment(req: Request, res: Response) {
     try {
-      const { amount, payment_method, customer_email, customer_name, customer_phone, description } = req.body;
+      // [BARU] Ambil reference_id
+      const { amount, payment_method, customer_email, customer_name, customer_phone, description, reference_id } = req.body;
 
+      // [BARU] Tambahkan validasi reference_id
       if (!amount || !payment_method) {
         return res.status(400).json({ error: 'Amount and payment method required' });
       }
@@ -14,7 +16,13 @@ export class PaymentController {
       const result = await PaymentOrchestrator.createPayment(
         parseFloat(amount),
         payment_method,
-        { email: customer_email, name: customer_name, phone: customer_phone, description }
+        { 
+          email: customer_email, 
+          name: customer_name, 
+          phone: customer_phone, 
+          description,
+          reference_id // Passing ke service
+        }
       );
 
       res.json({
@@ -59,14 +67,12 @@ export class PaymentController {
     }
   }
 
-  // 👇 METHOD BARU: Handle Webhook
   static async handleWebhook(req: Request, res: Response) {
     try {
       const { transaction_id, status } = req.body;
       const rawBody = req.body;       
       const rawHeaders = req.headers;
 
-      // Validasi Input
       if (!transaction_id || !status) {
         return res.status(400).json({ 
           success: false, 
@@ -74,7 +80,6 @@ export class PaymentController {
         });
       }
 
-      // Validasi Status yang diperbolehkan
       const allowedStatuses = ['SUCCESS', 'FAILED', 'PENDING'];
       if (!allowedStatuses.includes(status)) {
         return res.status(400).json({ 
@@ -82,16 +87,16 @@ export class PaymentController {
           error: 'Invalid status. Allowed: SUCCESS, FAILED, PENDING' 
         });
       }
-      // Log webhook ke database
+      
       await db.webhookLogs().insert({
-      provider: 'UNKNOWN', // Nanti bisa dideteksi dari header/body
-      transaction_id: transaction_id || null,
-      payload: rawBody,
-      headers: rawHeaders,
-      status: 'RECEIVED', // Status awal
-      received_at: new Date().toISOString()
-    });
-      // Update via Orchestrator
+        provider: 'UNKNOWN',
+        transaction_id: transaction_id || null,
+        payload: rawBody,
+        headers: rawHeaders,
+        status: 'RECEIVED',
+        received_at: new Date().toISOString()
+      });
+      
       const result = await PaymentOrchestrator.updateStatus(transaction_id, status);
 
       res.json({
@@ -108,15 +113,13 @@ export class PaymentController {
       });
     }
   }
-  // 👇 METHOD BARU: Simulasi Pembayaran Berhasil via Klik Link
+
   static async simulateSuccess(req: Request, res: Response) {
     try {
       const { transaction_id } = req.params;
       
-      // Panggil fungsi update status ke SUCCESS
       await PaymentOrchestrator.updateStatus(transaction_id, 'SUCCESS');
       
-      // Tampilkan halaman HTML sederhana biar jelas
       res.send(`
         <html>
           <body style="font-family: sans-serif; text-align: center; padding: 50px;">
@@ -124,10 +127,7 @@ export class PaymentController {
             <h1>Pembayaran Berhasil!</h1>
             <p>Transaksi <strong>${transaction_id}</strong> telah dilunasi.</p>
             <p>Status: <span style="color: green; font-weight: bold;">SUCCESS</span></p>
-            <script>
-              // Opsional: Tutup tab otomatis setelah 3 detik
-              setTimeout(() => window.close(), 3000);
-            </script>
+            <script>setTimeout(() => window.close(), 3000);</script>
           </body>
         </html>
       `);

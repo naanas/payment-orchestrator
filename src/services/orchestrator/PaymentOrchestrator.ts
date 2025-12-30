@@ -1,15 +1,42 @@
 import { db } from '../../config/supabase';
 import axios from 'axios'; 
+import crypto from 'crypto'; // [BARU] Import Crypto untuk keamanan Webhook
 
 export class PaymentOrchestrator {
   static async createPayment(amount: number, paymentMethodCode: string, customerData: any) {
     try {
+      // -------------------------------------------------------------
+      // 0. IDEMPOTENCY CHECK (Cek Reference ID)
+      // -------------------------------------------------------------
+      if (customerData.reference_id) {
+        const { data: existingTrx } = await db.transactions()
+          .select('*')
+          .eq('reference_id', customerData.reference_id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+
+        if (existingTrx) {
+          // Jika statusnya masih aktif, kembalikan data lama
+          if (['PENDING', 'PROCESSING', 'SUCCESS'].includes(existingTrx.status)) {
+            console.log(`[INFO] Returning existing transaction for Ref ID: ${customerData.reference_id}`);
+            return {
+              transaction_id: existingTrx.transaction_id,
+              payment_url: existingTrx.payment_url,
+              virtual_account: existingTrx.payment_data?.virtual_account,
+              qr_data: existingTrx.payment_data?.qr_data,
+              instructions: existingTrx.payment_data?.instructions,
+              expires_at: existingTrx.expires_at,
+              status: existingTrx.status,
+              is_existing: true 
+            };
+          }
+        }
+      }
+
       // 1. Get payment method
       const { data: method, error } = await db.paymentMethods()
-        .select(`
-          *,
-          payment_partners (*)
-        `)
+        .select(`*, payment_partners (*)`)
         .eq('code', paymentMethodCode)
         .eq('is_active', true)
         .single();
@@ -27,10 +54,11 @@ export class PaymentOrchestrator {
       // 3. Generate transaction ID
       const transactionId = `TRX${Date.now()}${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
 
-      // 4. Create transaction
-      const { data: transaction } = await db.transactions()
+      // 4. Create transaction (DENGAN ERROR HANDLING YANG LEBIH BAIK)
+      const { data: transaction, error: insertError } = await db.transactions()
         .insert({
           transaction_id: transactionId,
+          reference_id: customerData.reference_id || null,
           partner_id: method.partner_id,
           payment_method_id: method.id,
           amount,
@@ -45,19 +73,24 @@ export class PaymentOrchestrator {
         .select()
         .single();
 
+      // [FIX] Cek error spesifik DB (misal: kolom reference_id tidak ada)
+      if (insertError) {
+        console.error("❌ DATABASE INSERT ERROR:", insertError.message);
+        throw new Error(`Database Error: ${insertError.message}`);
+      }
+
       if (!transaction) throw new Error('Failed to create transaction');
 
-      // Define Base URL untuk simulasi
+      // Define Base URL
       const PORT = process.env.PORT || 3000;
       const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-      // 5. Generate payment data based on partner type
+      // 5. Generate payment data
       let paymentData: any = {};
       
       if (method.payment_partners.type === 'EWALLET') {
         paymentData = {
           partner_transaction_id: `EW${Date.now()}`,
-          // Link simulasi agar bisa diklik langsung lunas
           payment_url: `${baseUrl}/api/payments/pay-simulate/${transactionId}`,
           deeplink: `${method.payment_partners.code.toLowerCase()}://payment/${transactionId}`
         };
@@ -85,7 +118,7 @@ export class PaymentOrchestrator {
         };
       }
 
-      // 6. Update transaction dengan payment data
+      // 6. Update transaction
       await db.transactions()
         .update({
           partner_transaction_id: paymentData.partner_transaction_id,
@@ -122,7 +155,7 @@ export class PaymentOrchestrator {
     return transaction;
   }
 
-  // 👇 METHOD UPDATE STATUS (MODIFIKASI UTAMA DI SINI)
+  // [MODIFIKASI UTAMA DI SINI: WEBHOOK SIGNATURE]
   static async updateStatus(transactionId: string, status: string) { 
     try {
       // 1. Cek transaksi exist
@@ -133,7 +166,7 @@ export class PaymentOrchestrator {
 
       if (fetchError || !transaction) throw new Error('Transaction not found');
 
-      // 2. Update status & timestamp di Database Orchestrator
+      // 2. Update status & timestamp
       const { data: updatedTransaction, error: updateError } = await db.transactions()
         .update({ 
           status: status,
@@ -146,30 +179,38 @@ export class PaymentOrchestrator {
 
       if (updateError) throw new Error(updateError.message);
 
-      // ============================================================
-      // 3. KIRIM WEBHOOK KE ECOMMERCE (INTEGRASI BALIK)
-      // ============================================================
+      // 3. KIRIM WEBHOOK DENGAN KEAMANAN (SIGNATURE)
       try {
-        // [FIXED] Menggunakan Environment Variable untuk URL Webhook Ecommerce
-        // Pastikan Anda menambahkan ECOMMERCE_WEBHOOK_URL di file .env Payment Orchestrator
         const ecommerceWebhookUrl = process.env.ECOMMERCE_WEBHOOK_URL || 'https://ecommerce-api-topaz-iota.vercel.app/api/webhook/payment';
+        const secret = process.env.WEBHOOK_SECRET || 'rahasia-super-aman'; // Wajib sama dengan di Ecommerce API
 
         console.log(`🚀 Sending webhook to ${ecommerceWebhookUrl} for TRX: ${transactionId}...`);
         
-        // Kirim webhook
-        await axios.post(ecommerceWebhookUrl, {
+        // Buat Payload
+        const payload = {
           transaction_id: transactionId,
           status: status,
           updated_at: new Date().toISOString()
+        };
+
+        // [BARU] Buat HMAC Signature
+        const signature = crypto
+          .createHmac('sha256', secret)
+          .update(JSON.stringify(payload))
+          .digest('hex');
+
+        // Kirim dengan Header Signature
+        await axios.post(ecommerceWebhookUrl, payload, {
+          headers: { 
+            'x-signature': signature,
+            'Content-Type': 'application/json'
+          }
         });
         
         console.log(`✅ Webhook sent successfully!`);
 
       } catch (webhookError: any) {
-        // Kita hanya log error webhook, jangan throw error agar
-        // status di orchestrator tetap ter-update walau webhook gagal.
         console.error(`⚠️ Failed to send webhook: ${webhookError.message}`);
-        console.error(`(Make sure Ecommerce API is running and ECOMMERCE_WEBHOOK_URL env is set)`);
       }
 
       return updatedTransaction;
