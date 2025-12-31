@@ -1,6 +1,7 @@
 import { db } from '../../config/supabase';
 import axios from 'axios'; 
-import crypto from 'crypto'; // [BARU] Import Crypto untuk keamanan Webhook
+import crypto from 'crypto';
+import { mapRequest, mapResponse } from '../../utils/apiMapper'; 
 
 export class PaymentOrchestrator {
   static async createPayment(amount: number, paymentMethodCode: string, customerData: any) {
@@ -17,11 +18,11 @@ export class PaymentOrchestrator {
           .single();
 
         if (existingTrx) {
-          // Jika statusnya masih aktif, kembalikan data lama
           if (['PENDING', 'PROCESSING', 'SUCCESS'].includes(existingTrx.status)) {
             console.log(`[INFO] Returning existing transaction for Ref ID: ${customerData.reference_id}`);
             return {
               transaction_id: existingTrx.transaction_id,
+              amount: existingTrx.amount, // [FIX] Pastikan amount dikembalikan juga
               payment_url: existingTrx.payment_url,
               virtual_account: existingTrx.payment_data?.virtual_account,
               qr_data: existingTrx.payment_data?.qr_data,
@@ -34,7 +35,9 @@ export class PaymentOrchestrator {
         }
       }
 
-      // 1. Get payment method
+      // -------------------------------------------------------------
+      // 1. GET PAYMENT METHOD & PARTNER CONFIG
+      // -------------------------------------------------------------
       const { data: method, error } = await db.paymentMethods()
         .select(`*, payment_partners (*)`)
         .eq('code', paymentMethodCode)
@@ -43,18 +46,29 @@ export class PaymentOrchestrator {
 
       if (error || !method) throw new Error('Payment method not found');
 
-      // 2. Calculate fee
-      const feeStructure = method.payment_partners.fee_structure || { percentage: 1.5, fixed: 2000, cap: 10000 };
+      const partner = method.payment_partners;
+
+      // -------------------------------------------------------------
+      // 2. CALCULATE FEE
+      // -------------------------------------------------------------
+      const feeStructure = partner.fee_structure || { percentage: 1.5, fixed: 2000, cap: 10000 };
       const fee = Math.min(
         feeStructure.fixed + (amount * feeStructure.percentage / 100),
         feeStructure.cap || 999999999
       );
       const netAmount = amount - fee;
 
-      // 3. Generate transaction ID
+      // -------------------------------------------------------------
+      // 3. GENERATE TRANSACTION ID (Internal)
+      // -------------------------------------------------------------
       const transactionId = `TRX${Date.now()}${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+      
+      const PORT = process.env.PORT || 3000;
+      const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-      // 4. Create transaction (DENGAN ERROR HANDLING YANG LEBIH BAIK)
+      // -------------------------------------------------------------
+      // 4. INSERT TRANSACTION (Status: PENDING)
+      // -------------------------------------------------------------
       const { data: transaction, error: insertError } = await db.transactions()
         .insert({
           transaction_id: transactionId,
@@ -68,74 +82,122 @@ export class PaymentOrchestrator {
           customer_phone: customerData.phone,
           customer_name: customerData.name,
           description: customerData.description,
+          status: 'PENDING', 
           expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
         })
         .select()
         .single();
 
-      // [FIX] Cek error spesifik DB (misal: kolom reference_id tidak ada)
       if (insertError) {
         console.error("❌ DATABASE INSERT ERROR:", insertError.message);
         throw new Error(`Database Error: ${insertError.message}`);
       }
 
-      if (!transaction) throw new Error('Failed to create transaction');
-
-      // Define Base URL
-      const PORT = process.env.PORT || 3000;
-      const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
-
-      // 5. Generate payment data
+      // -------------------------------------------------------------
+      // 5. PROCESS PAYMENT (DYNAMIC VS HARDCODED)
+      // -------------------------------------------------------------
       let paymentData: any = {};
-      
-      if (method.payment_partners.type === 'EWALLET') {
-        paymentData = {
-          partner_transaction_id: `EW${Date.now()}`,
-          payment_url: `${baseUrl}/api/payments/pay-simulate/${transactionId}`,
-          deeplink: `${method.payment_partners.code.toLowerCase()}://payment/${transactionId}`
+      let finalStatus = 'PROCESSING';
+
+      // LOGIC DYNAMIC MAPPING
+      if (partner.mapping_schema && partner.mapping_schema.request) {
+        console.log(`[ORCHESTRATOR] Using Dynamic Mapping for ${partner.name}`);
+
+        const context = {
+          transaction_id: transactionId,
+          amount: Math.floor(amount), 
+          email: customerData.email,
+          name: customerData.name,
+          phone: customerData.phone,
+          description: customerData.description || `Payment for ${transactionId}`,
+          credentials: partner.credentials, 
+          config: {
+            return_url: `${baseUrl}/payment-success`,
+            callback_url: `${baseUrl}/api/payments/webhook`
+          }
         };
-      } else if (method.payment_partners.type === 'BANK_VA') {
-        const vaNumber = this.generateVANumber(method.payment_partners.code);
-        paymentData = {
-          partner_transaction_id: `VA${Date.now()}`,
-          virtual_account: vaNumber,
-          instructions: [
-            `Transfer ke VA: ${vaNumber}`,
-            `Bank: ${this.getBankName(method.payment_partners.code)}`,
-            `A/N: ${customerData.name || 'Customer'}`
-          ]
-        };
-      } else if (method.payment_partners.type === 'PAYMENT_GATEWAY') {
-        paymentData = {
-          partner_transaction_id: `PG${Date.now()}`,
-          payment_url: `https://payment.example.com/pay/${transactionId}`,
-          qr_data: `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${transactionId}`
-        };
+
+        try {
+          const axiosConfig = mapRequest(partner.mapping_schema, context);
+          
+          console.log(`[ORCHESTRATOR] Hitting Partner API: ${axiosConfig.method} ${axiosConfig.url}`);
+          
+          const response = await axios(axiosConfig);
+          const mappedData = mapResponse(partner.mapping_schema, response.data);
+          
+          paymentData = {
+            ...mappedData,
+            raw_response: response.data 
+          };
+
+          if (!paymentData.partner_transaction_id) {
+            paymentData.partner_transaction_id = `EXT-${transactionId}`;
+          }
+
+        } catch (apiError: any) {
+          console.error(`[ORCHESTRATOR] Partner API Failed:`, apiError.response?.data || apiError.message);
+          
+          await db.transactions()
+            .update({ status: 'FAILED', payment_data: { error: apiError.message } })
+            .eq('id', transaction.id);
+
+          throw new Error(`Partner API Error: ${apiError.message}`);
+        }
+
       } else {
-        paymentData = {
-          partner_transaction_id: `TX${Date.now()}`,
-          payment_url: `https://payment.example.com/pay/${transactionId}`
-        };
+        // LOGIC HARDCODED (FALLBACK)
+        console.log(`[ORCHESTRATOR] Using Hardcoded Logic for ${partner.name}`);
+        
+        if (partner.type === 'EWALLET') {
+          paymentData = {
+            partner_transaction_id: `EW${Date.now()}`,
+            payment_url: `${baseUrl}/api/payments/pay-simulate/${transactionId}`,
+            deeplink: `${partner.code.toLowerCase()}://payment/${transactionId}`
+          };
+        } else if (partner.type === 'BANK_VA') {
+          const vaNumber = this.generateVANumber(partner.code);
+          paymentData = {
+            partner_transaction_id: `VA${Date.now()}`,
+            virtual_account: vaNumber,
+            instructions: [
+              `Transfer ke VA: ${vaNumber}`,
+              `Bank: ${this.getBankName(partner.code)}`,
+              `A/N: ${customerData.name || 'Customer'}`
+            ]
+          };
+        } else if (partner.type === 'PAYMENT_GATEWAY') {
+          paymentData = {
+            partner_transaction_id: `PG${Date.now()}`,
+            payment_url: `https://payment.example.com/pay/${transactionId}`,
+            qr_data: `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${transactionId}`
+          };
+        }
       }
 
-      // 6. Update transaction
+      // -------------------------------------------------------------
+      // 6. UPDATE TRANSACTION DATA
+      // -------------------------------------------------------------
       await db.transactions()
         .update({
           partner_transaction_id: paymentData.partner_transaction_id,
           payment_url: paymentData.payment_url,
           payment_data: paymentData,
-          status: 'PROCESSING'
+          status: finalStatus
         })
         .eq('id', transaction.id);
 
+      // =========================================================
+      // [FIX UTAMA] Kembalikan 'amount' di response akhir
+      // =========================================================
       return {
         transaction_id: transactionId,
+        amount: amount, // <--- INI YANG HILANG SEBELUMNYA
         payment_url: paymentData.payment_url,
         virtual_account: paymentData.virtual_account,
         qr_data: paymentData.qr_data,
         instructions: paymentData.instructions,
         expires_at: transaction.expires_at,
-        status: 'PROCESSING'
+        status: finalStatus
       };
 
     } catch (error: any) {
@@ -143,6 +205,10 @@ export class PaymentOrchestrator {
       throw error;
     }
   }
+
+  // =================================================================
+  // EXISTING METHODS (CHECK STATUS, WEBHOOK, UTILS)
+  // =================================================================
 
   static async checkStatus(transactionId: string) {
     const { data: transaction, error } = await db.transactions()
@@ -155,10 +221,8 @@ export class PaymentOrchestrator {
     return transaction;
   }
 
-  // [MODIFIKASI UTAMA DI SINI: WEBHOOK SIGNATURE]
   static async updateStatus(transactionId: string, status: string) { 
     try {
-      // 1. Cek transaksi exist
       const { data: transaction, error: fetchError } = await db.transactions()
         .select('*')
         .eq('transaction_id', transactionId)
@@ -166,7 +230,6 @@ export class PaymentOrchestrator {
 
       if (fetchError || !transaction) throw new Error('Transaction not found');
 
-      // 2. Update status & timestamp
       const { data: updatedTransaction, error: updateError } = await db.transactions()
         .update({ 
           status: status,
@@ -179,27 +242,35 @@ export class PaymentOrchestrator {
 
       if (updateError) throw new Error(updateError.message);
 
-      // 3. KIRIM WEBHOOK DENGAN KEAMANAN (SIGNATURE)
-      try {
+      this.sendWebhookToClient(transactionId, status);
+
+      return updatedTransaction;
+
+    } catch (error: any) {
+      throw new Error(`Failed to update status: ${error.message}`);
+    }
+  }
+
+  private static async sendWebhookToClient(transactionId: string, status: string) {
+    try {
         const ecommerceWebhookUrl = process.env.ECOMMERCE_WEBHOOK_URL || '';
-        const secret = process.env.WEBHOOK_SECRET || 'rahasia-super-aman'; // Wajib sama dengan di Ecommerce API
+        const secret = process.env.WEBHOOK_SECRET || 'rahasia-super-aman';
+
+        if (!ecommerceWebhookUrl) return;
 
         console.log(`🚀 Sending webhook to ${ecommerceWebhookUrl} for TRX: ${transactionId}...`);
         
-        // Buat Payload
         const payload = {
           transaction_id: transactionId,
           status: status,
           updated_at: new Date().toISOString()
         };
 
-        // [BARU] Buat HMAC Signature
         const signature = crypto
           .createHmac('sha256', secret)
           .update(JSON.stringify(payload))
           .digest('hex');
 
-        // Kirim dengan Header Signature
         await axios.post(ecommerceWebhookUrl, payload, {
           headers: { 
             'x-signature': signature,
@@ -208,15 +279,8 @@ export class PaymentOrchestrator {
         });
         
         console.log(`✅ Webhook sent successfully!`);
-
-      } catch (webhookError: any) {
+    } catch (webhookError: any) {
         console.error(`⚠️ Failed to send webhook: ${webhookError.message}`);
-      }
-
-      return updatedTransaction;
-
-    } catch (error: any) {
-      throw new Error(`Failed to update status: ${error.message}`);
     }
   }
 

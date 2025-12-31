@@ -6,11 +6,10 @@ import { db } from '../config/supabase';
 export class AdminController {
   
   // =================================================================
-  // [BARU] Endpoint Config: Ambil Fee Dinamis dari Payment Method
+  // [CONFIG] Ambil Fee Dinamis dari Payment Method
   // =================================================================
   static async getConfig(req: Request, res: Response) {
     try {
-      // 1. Terima kode metode dari Frontend (misal: ?code=BCA_VA)
       const methodCode = req.query.code as string;
 
       if (!methodCode) {
@@ -20,8 +19,6 @@ export class AdminController {
         });
       }
 
-      // 2. Query ke payment_methods dan join ke payment_partners
-      // Mengambil fee_structure dari partner yang terkait dengan metode tersebut
       const { data, error } = await db.paymentMethods()
         .select(`
           code,
@@ -32,10 +29,9 @@ export class AdminController {
           )
         `)
         .eq('code', methodCode)
-        .eq('is_active', true)
+        .eq('is_active', true) // Pastikan tabel payment_methods punya kolom is_active
         .single();
 
-      // 3. Validasi jika tidak ditemukan di DB
       if (error || !data) {
         console.warn(`Metode pembayaran '${methodCode}' tidak ditemukan atau tidak aktif.`);
         return res.status(404).json({
@@ -44,26 +40,20 @@ export class AdminController {
         });
       }
 
-      // 4. Parsing Fee Structure
       let adminFee = 0;
-      // Casting 'any' karena Supabase join return type bisa bervariasi
       const partner = (data as any).payment_partners; 
 
       if (partner && partner.fee_structure) {
         const structure = partner.fee_structure;
-        
-        // Logic parsing JSON fee (menangani format number atau object)
         if (typeof structure === 'number') {
            adminFee = structure;
         } else if (typeof structure === 'object') {
-           // Prioritas ambil nilai flat/fixed/admin_fee
            adminFee = Number(structure.flat || structure.fixed || structure.admin_fee || 0);
         } else if (typeof structure === 'string') {
            adminFee = Number(structure);
         }
       }
 
-      // 5. Return Response
       res.json({
         success: true,
         data: {
@@ -77,7 +67,7 @@ export class AdminController {
     } catch (error: any) {
       console.error("Config Error:", error.message);
       res.status(500).json({ 
-        success: false,
+        success: false, 
         message: "Gagal mengambil konfigurasi Admin Fee",
         error: error.message 
       });
@@ -85,7 +75,7 @@ export class AdminController {
   }
 
   // =================================================================
-  // EXISTING METHODS (LOGIN, DASHBOARD, DLL)
+  // AUTH & DASHBOARD
   // =================================================================
 
   static async login(req: Request, res: Response) {
@@ -109,10 +99,9 @@ export class AdminController {
       const token = jwt.sign(
         { userId: user.id, email: user.email, role: user.role },
         process.env.JWT_SECRET!,
-        { expiresIn: 500 } // Session 5 menit
+        { expiresIn: 500 }
       );
 
-      // Update last login
       await db.users()
         .update({ last_login_at: new Date().toISOString() })
         .eq('id', user.id);
@@ -136,7 +125,6 @@ export class AdminController {
 
   static async getDashboard(req: Request, res: Response) {
     try {
-      // Get stats
       const { count: totalTx } = await db.transactions()
         .select('*', { count: 'exact', head: true });
 
@@ -152,13 +140,11 @@ export class AdminController {
         .select('*', { count: 'exact', head: true })
         .eq('status', 'ACTIVE');
 
-      // Get recent transactions
       const { data: recentTransactions } = await db.transactions()
         .select('*, payment_partners(name, code), payment_methods(name)')
         .order('created_at', { ascending: false })
         .limit(10);
 
-      // Get today's revenue
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       
@@ -188,6 +174,10 @@ export class AdminController {
     }
   }
 
+  // =================================================================
+  // PARTNERS MANAGEMENT
+  // =================================================================
+
   static async getPartners(req: Request, res: Response) {
     try {
       const { data: partners } = await db.paymentPartners()
@@ -200,10 +190,64 @@ export class AdminController {
     }
   }
 
+  // [PERBAIKAN UTAMA ADA DI SINI]
+  static async createPartner(req: Request, res: Response) {
+    try {
+      const { name, code, type, is_active, fee_structure, credentials, mapping_schema } = req.body;
+
+      // Validasi Input
+      if (!name || !code || !type) {
+        return res.status(400).json({ success: false, error: 'Name, code, and type are required' });
+      }
+
+      // Logic Mapping: Jika is_active false -> INACTIVE, selain itu ACTIVE
+      const statusValue = (is_active === false) ? 'INACTIVE' : 'ACTIVE';
+
+      // Insert ke DB
+      const { data: partner, error } = await db.paymentPartners()
+        .insert({
+          name,
+          code,
+          type,
+          // Field 'is_active' dihapus, diganti dengan 'status'
+          status: statusValue,
+          fee_structure,
+          credentials,
+          mapping_schema,
+          updated_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Log Audit
+      await db.auditLogs().insert({
+        user_id: (req as any).user.id,
+        action: 'CREATE_PARTNER',
+        entity_type: 'payment_partner',
+        entity_id: partner.id,
+        new_value: req.body,
+        ip_address: req.ip
+      });
+
+      res.status(201).json({ success: true, data: partner });
+    } catch (error: any) {
+      console.error("Create Partner Failed:", error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
   static async updatePartner(req: Request, res: Response) {
     try {
       const { id } = req.params;
       const updates = req.body;
+
+      // Jika update menyertakan is_active, perlu dimapping ke status juga
+      if (updates.is_active !== undefined) {
+         updates.status = (updates.is_active === false) ? 'INACTIVE' : 'ACTIVE';
+         delete updates.is_active; // Hapus field agar tidak error saat update
+      }
 
       const { data: partner } = await db.paymentPartners()
         .update(updates)
@@ -211,7 +255,6 @@ export class AdminController {
         .select()
         .single();
 
-      // Log audit
       await db.auditLogs().insert({
         user_id: (req as any).user.id,
         action: 'UPDATE_PARTNER',
